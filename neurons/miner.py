@@ -15,21 +15,193 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import asyncio
+import os
 import time
 import typing
+
+import requests
 import bittensor as bt
 
 # Bittensor Miner Quant:
 import quant
-
-# Import the subnet_query function from BitQuant client
-# from quant.BitQuant.subnet.subnet_methods import subnet_query
 
 # import base miner class which takes care of most of the boilerplate
 from quant.base.miner import BaseMinerNeuron
 
 # Import the shared Quant agent server module
 from neurons import quant_agent_server
+
+_AGENT_QUERY_URL: typing.Optional[str] = None
+
+
+def _get_agent_query_url() -> str:
+    """Construct the Quant agent query URL."""
+
+    global _AGENT_QUERY_URL
+
+    if _AGENT_QUERY_URL is None:
+        base_url = os.getenv("QUANT_AGENT_SERVER_URL")
+        if base_url:
+            base = base_url.rstrip("/")
+        else:
+            base = f"http://127.0.0.1:{quant_agent_server.QUANT_AGENT_SERVER_PORT}"
+
+        route = os.getenv("QUANT_AGENT_QUERY_ROUTE", "/query")
+        if not route.startswith("/"):
+            route = f"/{route}"
+
+        _AGENT_QUERY_URL = f"{base}{route}"
+
+    return _AGENT_QUERY_URL
+
+
+def _get_agent_timeout() -> float:
+    """Fetch the request timeout for the Quant agent server."""
+
+    timeout_value = os.getenv("QUANT_AGENT_TIMEOUT", "60")
+    try:
+        return float(timeout_value)
+    except (TypeError, ValueError):
+        bt.logging.warning(
+            "Invalid QUANT_AGENT_TIMEOUT value '%s'. Falling back to 60 seconds.",
+            timeout_value,
+        )
+        return 60.0
+
+
+def _coerce_bytes(value: typing.Any) -> bytes:
+    """Ensure a field from the agent payload is converted to bytes."""
+
+    if isinstance(value, bytes):
+        return value
+    if value is None:
+        return b""
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+
+    try:
+        return bytes(value)
+    except (TypeError, ValueError):
+        return str(value).encode("utf-8")
+
+
+def _normalize_proofs(proofs: typing.Any) -> list[bytes]:
+    """Convert the proofs collection into a list of bytes."""
+
+    if not isinstance(proofs, (list, tuple)):
+        return []
+
+    normalized: list[bytes] = []
+    for proof in proofs:
+        normalized.append(_coerce_bytes(proof))
+    return normalized
+
+
+def _extract_quant_response_payload(
+    payload: typing.Any,
+) -> dict[str, typing.Any]:
+    """Extract the QuantResponse payload from the agent JSON response."""
+
+    if isinstance(payload, dict):
+        for key in ("data", "result", "payload"):
+            candidate = payload.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+        return payload
+
+    return {"response": payload}
+
+
+def _build_quant_response(
+    payload: dict[str, typing.Any],
+    query: quant.protocol.QuantQuery,
+) -> quant.protocol.QuantResponse:
+    """Construct a QuantResponse object from the agent payload."""
+
+    response_text = payload.get("response")
+    if not isinstance(response_text, str):
+        response_text = "" if response_text is None else str(response_text)
+
+    signature = _coerce_bytes(payload.get("signature"))
+    proofs = _normalize_proofs(payload.get("proofs"))
+
+    metadata_field = payload.get("metadata")
+    if isinstance(metadata_field, dict):
+        metadata = dict(metadata_field)
+    else:
+        metadata = {}
+        if metadata_field is not None:
+            metadata["raw_metadata"] = metadata_field
+
+    metadata.setdefault("source", "quant_agent_server")
+    if query.metadata:
+        metadata.setdefault("query_metadata", query.metadata)
+
+    return quant.protocol.QuantResponse(
+        response=response_text,
+        signature=signature,
+        proofs=proofs,
+        metadata=metadata,
+    )
+
+
+def _send_quant_agent_request(
+    query: quant.protocol.QuantQuery,
+) -> typing.Optional[quant.protocol.QuantResponse]:
+    """Perform the HTTP request to the Quant agent server."""
+
+    if query is None:
+        bt.logging.error("Quant agent request received an empty query object.")
+        return None
+
+    payload = {
+        "query": query.query,
+        "userID": query.userID,
+        "metadata": query.metadata or {},
+    }
+
+    response_obj: typing.Optional[requests.Response] = None
+    try:
+        response_obj = requests.post(
+            _get_agent_query_url(),
+            json=payload,
+            timeout=_get_agent_timeout(),
+        )
+        response_obj.raise_for_status()
+        raw_payload = response_obj.json()
+    except requests.RequestException as exc:
+        bt.logging.error(f"Quant agent request failed: {exc}")
+        return None
+    except ValueError as exc:
+        bt.logging.error(f"Quant agent returned invalid JSON: {exc}")
+        return None
+    finally:
+        if response_obj is not None:
+            response_obj.close()
+
+    try:
+        quant_payload = _extract_quant_response_payload(raw_payload)
+        return _build_quant_response(quant_payload, query)
+    except Exception as exc:  # pylint: disable=broad-except
+        bt.logging.error(f"Unable to build QuantResponse from agent payload: {exc}")
+        return None
+
+
+async def query_quant_agent(
+    query: quant.protocol.QuantQuery,
+) -> typing.Optional[quant.protocol.QuantResponse]:
+    """Fetch a QuantResponse from the locally running Quant agent server."""
+
+    try:
+        return await asyncio.to_thread(_send_quant_agent_request, query)
+    except RuntimeError:
+        # Fallback in case we're running outside of an event loop.
+        return _send_quant_agent_request(query)
 
 class Miner(BaseMinerNeuron):
     """
@@ -49,8 +221,8 @@ class Miner(BaseMinerNeuron):
         self, synapse: quant.protocol.QuantSynapse
     ) -> quant.protocol.QuantSynapse:
         """
-        Processes the incoming 'QuantSynapse' request by forwarding it to the BitQuant subnet
-        using the subnet_query function.
+        Processes the incoming 'QuantSynapse' request by forwarding it to the locally managed
+        BitQuant agent server via the `query_quant_agent` helper.
 
         Args:
             synapse (quant.protocol.QuantSynapse): The synapse object containing the query.
@@ -74,10 +246,10 @@ class Miner(BaseMinerNeuron):
                 bt.logging.info(f"Metadata: {synapse.query.metadata}")
                 
                 # TODO(developer): Developers deploying miner nodes can add their own custom mining logic here.
-                # Replace or extend this call to 'subnet_query' with your own implementation as needed.
-                response = subnet_query(synapse.query)
+                response = await query_quant_agent(synapse.query)
                 
                 if response is None:
+                    bt.logging.warning("Quant agent returned no response; providing fallback error message.")
                     response = quant.protocol.QuantResponse(
                         response="Error: Failed to communicate with quant agent",
                         signature=b"error",
@@ -86,15 +258,16 @@ class Miner(BaseMinerNeuron):
                     )
                 else:
                     bt.logging.info(f"Received response from quant agent: {response.response[:100]}...")
-                    # Convert to dictionary and then set the response
-                    response.metadata["miner_id"] = self.wallet.hotkey.ss58_address
-                    response_dict = {
-                        "response": response.response,
-                        "signature": response.signature,
-                        "proofs": response.proofs,
-                        "metadata": response.metadata
-                    }
-                    synapse.response = response_dict
+
+                response_metadata = dict(response.metadata or {})
+                response_metadata["miner_id"] = self.wallet.hotkey.ss58_address
+                response.metadata = response_metadata
+                synapse.response = {
+                    "response": response.response,
+                    "signature": response.signature,
+                    "proofs": response.proofs,
+                    "metadata": response_metadata,
+                }
             return synapse
         except Exception as e:
             bt.logging.error(f"Error in forward: {e}")
